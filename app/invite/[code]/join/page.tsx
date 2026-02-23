@@ -1,5 +1,6 @@
 import { createClient } from "@/lib/supabase/server"
 import { redirect, notFound } from "next/navigation"
+import { JoinRequestForm } from "./join-request-form"
 
 async function ensureProfile(
   supabase: Awaited<ReturnType<typeof createClient>>,
@@ -7,27 +8,21 @@ async function ensureProfile(
   email: string | null
 ) {
   const fallbackName = email ? email.split("@")[0] : null
-
   const { data: existing } = await supabase
     .from("profiles")
     .select("display_name")
     .eq("id", userId)
     .single()
-
   if (!existing) {
-    const { error } = await supabase.from("profiles").insert({
+    await supabase.from("profiles").insert({
       id: userId,
       email,
       display_name: fallbackName
     })
-    if (error) {
-      // If this fails, we still allow joining the game; profile can be fixed later.
-      console.error("Error ensuring profile in invite route:", error)
-    }
   }
 }
 
-export default async function InvitePage({
+export default async function InviteJoinPage({
   params
 }: {
   params: Promise<{ code: string }>
@@ -39,16 +34,15 @@ export default async function InvitePage({
   } = await supabase.auth.getUser()
 
   if (!user) {
-    redirect(`/login?next=${encodeURIComponent(`/invite/${code}`)}`)
+    redirect(`/login?next=${encodeURIComponent(`/invite/${code}/join`)}`)
   }
 
   await ensureProfile(supabase, user.id, user.email ?? null)
 
   const shortCode = code.trim().toLowerCase()
-
   const { data: game, error: gameError } = await supabase
     .from("games")
-    .select("id, status")
+    .select("id, status, description")
     .eq("short_code", shortCode)
     .single()
 
@@ -67,6 +61,10 @@ export default async function InvitePage({
     redirect(`/game/${game.id}`)
   }
 
-  redirect(`/invite/${code}/join`)
+  return (
+    <JoinRequestForm
+      gameId={game.id}
+      gameDescription={game.description ?? undefined}
+    />
+  )
 }
-

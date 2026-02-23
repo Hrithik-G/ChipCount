@@ -41,16 +41,32 @@ export default async function GamePage({
   }
 
   const players =
-    rawPlayers?.map((p: any) => ({
-      user_id: p.user_id,
-      status: p.status,
-      cash_in: Number(p.cash_in ?? 0),
-      cash_out: Number(p.cash_out ?? 0),
-      requested_cash_in: Number(p.requested_cash_in ?? p.cash_in ?? 0),
-      requested_cash_out: Number(p.requested_cash_out ?? p.cash_out ?? 0),
-      display_name: p.profile?.display_name ?? null,
-      venmo_handle: p.profile?.venmo_handle ?? null
-    })) ?? []
+    rawPlayers?.map(
+      (p: {
+        user_id: string
+        status: string
+        cash_in: number | null
+        cash_out: number | null
+        requested_cash_in: number | null
+        requested_cash_out: number | null
+        profile:
+        | { display_name: string | null; venmo_handle: string | null }
+        | { display_name: string | null; venmo_handle: string | null }[]
+        | null
+      }) => {
+        const prof = Array.isArray(p.profile) ? p.profile[0] : p.profile
+        return {
+          user_id: p.user_id,
+          status: p.status as "pending" | "approved" | "denied",
+          cash_in: Number(p.cash_in ?? 0),
+          cash_out: Number(p.cash_out ?? 0),
+          requested_cash_in: Number(p.requested_cash_in ?? p.cash_in ?? 0),
+          requested_cash_out: Number(p.requested_cash_out ?? p.cash_out ?? 0),
+          display_name: prof?.display_name ?? null,
+          venmo_handle: prof?.venmo_handle ?? null
+        }
+      }
+    ) ?? []
 
   const isHost = game.host_id === user.id
 

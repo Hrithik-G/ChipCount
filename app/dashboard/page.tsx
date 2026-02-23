@@ -1,3 +1,4 @@
+import { closeGame } from "@/lib/actions"
 import { createClient } from "@/lib/supabase/server"
 import { redirect } from "next/navigation"
 import { DashboardActions } from "@/components/dashboard-actions"
@@ -15,10 +16,10 @@ export default async function DashboardPage() {
 
   const { data: memberships } = await supabase
     .from("game_players")
-    .select("status, game:games(id, short_code, description, status, host_id)")
+    .select("status, game:games!inner(id, short_code, description, status, host_id)")
     .eq("user_id", user.id)
-    .neq("status", "denied")
-    .eq("game.status", "active")
+    .neq("status", "pending")   // exclude people who requested but were never approved
+    .in("games.status", ["active", "closed"])
 
   return (
     <div className="mx-auto max-w-2xl space-y-8">
@@ -43,31 +44,54 @@ export default async function DashboardPage() {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
-            {memberships.map((m: any) => {
-              const game = m.game
+            {memberships.map((m: { status: string; game: { id: string; short_code: string; description: string; status: string; host_id: string } | { id: string; short_code: string; description: string; status: string; host_id: string }[] | null }) => {
+              const game = Array.isArray(m.game) ? m.game[0] : m.game
               if (!game) return null
               const isHost = game.host_id === user.id
-              const roleLabel = isHost ? "Host" : m.status === "approved" ? "Player" : "Pending"
+              const isDenied = m.status === "denied"
+              const roleLabel = isHost
+                ? "Host"
+                : m.status === "approved"
+                  ? "Player"
+                  : isDenied
+                    ? "Removed"
+                    : "Pending"
 
               return (
                 <div
                   key={game.id}
-                  className="flex items-center justify-between rounded border px-3 py-2 text-sm"
+                  className={`flex items-center justify-between rounded border px-3 py-2 text-sm ${isDenied ? "border-red-500/20 bg-red-500/5 opacity-75" : ""
+                    }`}
                 >
                   <div>
                     <p className="font-medium">
                       {game.description || "Game"}{" "}
-                      <span className="text-muted-foreground ml-1 text-xs">
+                      <span className={`ml-1 text-xs ${isDenied ? "text-red-400" : "text-muted-foreground"
+                        }`}>
                         ({roleLabel})
                       </span>
                     </p>
                     <p className="text-muted-foreground text-xs">
                       ID: <span className="font-mono">{game.short_code}</span>
                     </p>
+                    {isDenied && (
+                      <p className="text-red-400/80 text-xs mt-0.5">
+                        You were removed — open the game to request to rejoin.
+                      </p>
+                    )}
                   </div>
-                  <Button asChild size="sm" variant="outline">
-                    <Link href={`/game/${game.id}`}>Open</Link>
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button asChild size="sm" variant="outline">
+                      <Link href={`/game/${game.id}`}>Open</Link>
+                    </Button>
+                    {isHost && (
+                      <form action={closeGame.bind(null, game.id)}>
+                        <Button variant="destructive" size="sm" type="submit">
+                          Close Game
+                        </Button>
+                      </form>
+                    )}
+                  </div>
                 </div>
               )
             })}

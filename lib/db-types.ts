@@ -1,4 +1,4 @@
-export type GameStatus = "active" | "ended"
+export type GameStatus = "active" | "closed" | "ended"
 export type GamePlayerStatus = "pending" | "approved" | "denied"
 
 export type Profile = {

@@ -2,6 +2,7 @@ import { createClient } from "@/lib/supabase/server"
 import { redirect, notFound } from "next/navigation"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
+import { BarChart2 } from "lucide-react"
 
 export default async function GameLayout({
   children,
@@ -44,12 +45,21 @@ export default async function GameLayout({
             <Link href="/dashboard">
               <Button variant="ghost" size="sm">Dashboard</Button>
             </Link>
-            <span className="text-muted-foreground">Game {game.short_code}</span>
+            <Link href={`/game/${gameId}`} className="text-muted-foreground hover:text-foreground transition-colors">
+              Game {game.short_code}
+            </Link>
             {isHost && <span className="rounded bg-primary/20 px-2 py-0.5 text-xs">Host</span>}
           </div>
+          <Link href={`/game/${gameId}/metrics`}>
+            <Button variant="outline" size="sm">
+              <BarChart2 className="mr-1.5 h-4 w-4" />
+              Metrics
+            </Button>
+          </Link>
         </div>
       </header>
       <main className="flex-1 p-4">{children}</main>
     </div>
   )
 }
+

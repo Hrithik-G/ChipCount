@@ -17,23 +17,31 @@ export function DonutCharts({ payout }: { payout: PayoutSchema }) {
   const smallestNet = players[players.length - 1].net
   const largestNet = players[0].net
 
-  const genColors = (lowerBound: number, upperBound: number) => {
-    const rootStyles = window.getComputedStyle(document.documentElement) // Will error on first load, but will refresh and work
-    const success = rootStyles.getPropertyValue("--color-success").trim()
-    const destructive = rootStyles
-      .getPropertyValue("--color-destructive")
-      .trim()
-    const muted = rootStyles.getPropertyValue("--muted-foreground").trim()
-
+  const colors = useMemo(() => {
+    const lowerBound = smallestNet
+    const upperBound = largestNet
+    let success: string
+    let destructive: string
+    let muted: string
+    if (typeof window === "undefined") {
+      success = "#22c55e"
+      destructive = "#ef4444"
+      muted = "#71717a"
+    } else {
+      const rootStyles = window.getComputedStyle(document.documentElement)
+      success = rootStyles.getPropertyValue("--color-success").trim() || "#22c55e"
+      destructive =
+        rootStyles.getPropertyValue("--color-destructive").trim() || "#ef4444"
+      muted =
+        rootStyles.getPropertyValue("--muted-foreground").trim() || "#71717a"
+    }
     return chroma
       .scale([success, muted, destructive])
       .mode("lrgb")
       .domain([lowerBound, 0, upperBound])
       .colors(upperBound + Math.abs(lowerBound) + 1)
       .toReversed()
-  }
-
-  const colors = genColors(smallestNet, largestNet)
+  }, [smallestNet, largestNet])
 
   const playersData = players.map((player) => ({
     name: player.displayName,

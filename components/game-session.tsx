@@ -3,13 +3,14 @@
 import { useState, useMemo, useEffect } from "react"
 import { useRouter } from "next/navigation"
 import { createClient } from "@/lib/supabase/client"
+import { setGameStatus, kickPlayer, requestRejoin, transferHost, updateRequestedAmounts } from "@/lib/actions"
 import { calcPayouts } from "@/lib/utils"
 import type { GameSchema } from "@/lib/schemas"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { PayoutStatsView } from "./payout-stats-view"
-import { Loader2, Check, X, Copy } from "lucide-react"
+import { Loader2, Check, X, Copy, Lock, LockOpen, Crown, ArrowRightLeft } from "lucide-react"
 import { toast } from "sonner"
 
 type Game = {
@@ -48,42 +49,106 @@ export function GameSession({
   const [players, setPlayers] = useState<PlayerRow[]>(initialPlayers)
   const [updating, setUpdating] = useState<string | null>(null)
   const [ending, setEnding] = useState(false)
+  const [togglingClose, setTogglingClose] = useState(false)
+  const [kicking, setKicking] = useState<string | null>(null)
+  const [gameStatus, setGameStatus_] = useState(game.status)
+  const [selectedPlayer, setSelectedPlayer] = useState<PlayerRow | null>(null)
+  const [transferring, setTransferring] = useState(false)
+  const [transferConfirm, setTransferConfirm] = useState(false)
 
   const origin =
     baseUrl ?? (typeof window !== "undefined" ? window.location.origin : "")
   const inviteUrl = `${origin}/invite/${game.short_code}`
 
+  const isClosed = gameStatus === "closed"
   const approved = players.filter((p) => p.status === "approved")
   const pending = players.filter((p) => p.status === "pending")
+
+  async function handleKick(userId: string) {
+    setKicking(userId)
+    // Optimistic: remove from local list immediately
+    setPlayers((prev) => prev.filter((p) => p.user_id !== userId))
+    try {
+      await kickPlayer(game.id, userId)
+      toast.success("Player removed")
+    } catch (err) {
+      toast.error("Failed to remove player")
+      // Revert by refetching
+      fetchAll()
+    } finally {
+      setKicking(null)
+    }
+  }
+
+  async function handleTransferHost(targetUserId: string) {
+    setTransferring(true)
+    try {
+      await transferHost(game.id, targetUserId)
+      toast.success("Host transferred successfully")
+      setSelectedPlayer(null)
+      setTransferConfirm(false)
+      router.refresh()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to transfer host")
+    } finally {
+      setTransferring(false)
+    }
+  }
+
+  // Fetch fresh player data directly from Supabase on the client
+  async function fetchAll() {
+    const supabase = createClient()
+
+    // Fetch current game status
+    const { data: gameData } = await supabase
+      .from("games")
+      .select("status")
+      .eq("id", game.id)
+      .single()
+    if (gameData) {
+      setGameStatus_(gameData.status as "active" | "closed" | "ended")
+    }
+
+    // Fetch current players
+    const { data } = await supabase
+      .from("game_players")
+      .select("user_id, status, cash_in, cash_out, requested_cash_in, requested_cash_out, profile:profiles(display_name, venmo_handle)")
+      .eq("game_id", game.id)
+    if (data) {
+      setPlayers(
+        data.map((p: {
+          user_id: string
+          status: string
+          cash_in: number | null
+          cash_out: number | null
+          requested_cash_in: number | null
+          requested_cash_out: number | null
+          profile: { display_name: string | null; venmo_handle: string | null } | { display_name: string | null; venmo_handle: string | null }[] | null
+        }) => {
+          const prof = Array.isArray(p.profile) ? p.profile[0] : p.profile
+          return {
+            user_id: p.user_id,
+            status: p.status as "pending" | "approved" | "denied",
+            cash_in: Number(p.cash_in ?? 0),
+            cash_out: Number(p.cash_out ?? 0),
+            requested_cash_in: Number(p.requested_cash_in ?? p.cash_in ?? 0),
+            requested_cash_out: Number(p.requested_cash_out ?? p.cash_out ?? 0),
+            display_name: prof?.display_name ?? null,
+            venmo_handle: prof?.venmo_handle ?? null,
+          }
+        })
+      )
+    }
+  }
+
+  // Keep fetchPlayers as alias for backwards compat with realtime callbacks
+  const fetchPlayers = fetchAll
 
   useEffect(() => {
     const supabase = createClient()
 
-    async function syncPlayers() {
-      const { data, error } = await supabase
-        .from("game_players")
-        .select(
-          "user_id, status, cash_in, cash_out, requested_cash_in, requested_cash_out, profile:profiles(display_name, venmo_handle)"
-        )
-        .eq("game_id", game.id)
-
-      if (error || !data) return
-
-      setPlayers(
-        data.map((p: any) => ({
-          user_id: p.user_id,
-          status: p.status,
-          cash_in: Number(p.cash_in ?? 0),
-          cash_out: Number(p.cash_out ?? 0),
-          requested_cash_in: Number(p.requested_cash_in ?? p.cash_in ?? 0),
-          requested_cash_out: Number(p.requested_cash_out ?? p.cash_out ?? 0),
-          display_name: p.profile?.display_name ?? null,
-          venmo_handle: p.profile?.venmo_handle ?? null
-        }))
-      )
-    }
-
-    const channel = supabase
+    // Watch player changes — realtime fast path (fires instantly when RLS allows)
+    const playersChannel = supabase
       .channel(`game_players:${game.id}`)
       .on(
         "postgres_changes",
@@ -93,18 +158,34 @@ export function GameSession({
           table: "game_players",
           filter: `game_id=eq.${game.id}`
         },
-        () => {
-          syncPlayers()
-        }
+        () => fetchAll()
       )
       .subscribe()
 
-    // Initial sync in case state is stale
-    syncPlayers()
+    // Watch game status changes — realtime fast path
+    const gameChannel = supabase
+      .channel(`games:${game.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "games",
+          filter: `id=eq.${game.id}`
+        },
+        () => fetchAll()
+      )
+      .subscribe()
+
+    // Polling fallback — guarantees updates every 4s even if realtime/RLS blocks events
+    const pollInterval = setInterval(() => fetchAll(), 4000)
 
     return () => {
-      supabase.removeChannel(channel)
+      supabase.removeChannel(playersChannel)
+      supabase.removeChannel(gameChannel)
+      clearInterval(pollInterval)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [game.id])
 
   const gameForPayout = useMemo((): GameSchema | null => {
@@ -180,6 +261,20 @@ export function GameSession({
     await updatePlayerFields(gameId, userId, { status })
   }
 
+  async function handleToggleClose() {
+    setTogglingClose(true)
+    try {
+      const newStatus = isClosed ? "active" : "closed"
+      await setGameStatus(game.id, newStatus)
+      setGameStatus_(newStatus)
+      toast.success(isClosed ? "Session reopened" : "Session closed — edits are locked")
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setTogglingClose(false)
+    }
+  }
+
   async function handleEndGame() {
     if (!payout || !gameForPayout || approved.length < 2) return
     setEnding(true)
@@ -243,10 +338,29 @@ export function GameSession({
               <span className="font-mono break-all">{inviteUrl}</span>
             </CardDescription>
           </div>
-          <Button variant="outline" size="sm" onClick={copyGameLink}>
-            <Copy className="mr-1 h-4 w-4" />
-            Copy link
-          </Button>
+          <div className="flex items-center gap-2">
+            {isHost && (
+              <Button
+                variant={isClosed ? "outline" : "secondary"}
+                size="sm"
+                onClick={handleToggleClose}
+                disabled={togglingClose}
+              >
+                {togglingClose ? (
+                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                ) : isClosed ? (
+                  <LockOpen className="mr-1 h-4 w-4" />
+                ) : (
+                  <Lock className="mr-1 h-4 w-4" />
+                )}
+                {isClosed ? "Reopen Session" : "Close Session"}
+              </Button>
+            )}
+            <Button variant="outline" size="sm" onClick={copyGameLink}>
+              <Copy className="mr-1 h-4 w-4" />
+              Copy link
+            </Button>
+          </div>
         </CardHeader>
       </Card>
 
@@ -305,8 +419,18 @@ export function GameSession({
       <Card>
         <CardHeader>
           <CardTitle>Players & amounts</CardTitle>
-          <CardDescription>Cash in / out per player (editable by host or self if approved)</CardDescription>
+          <CardDescription>
+            {isClosed
+              ? "Session is closed — amounts are locked. Host can reopen to allow edits."
+              : "Cash in / out per player (editable by host or self if approved)"}
+          </CardDescription>
         </CardHeader>
+        {isClosed && (
+          <div className="mx-6 mb-2 flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-500">
+            <Lock className="h-4 w-4 shrink-0" />
+            Session closed — all edits are locked until the host reopens it.
+          </div>
+        )}
         <CardContent>
           <div className="space-y-3">
             {players.map((p) => (
@@ -314,8 +438,21 @@ export function GameSession({
                 key={p.user_id}
                 className="flex flex-wrap items-center gap-2 rounded border p-2"
               >
-                <span className="min-w-[120px] font-medium">
-                  {p.display_name || p.user_id.slice(0, 8)}
+                {/* Player name: host can click approved players to open action modal */}
+                <span className="font-medium">
+                  {isHost && p.status === "approved" && p.user_id !== currentUserId ? (
+                    <button
+                      className="cursor-pointer text-left underline underline-offset-2 decoration-white"
+                      onClick={() => {
+                        setSelectedPlayer(p)
+                        setTransferConfirm(false)
+                      }}
+                    >
+                      {p.display_name || p.user_id.slice(0, 8)}
+                    </button>
+                  ) : (
+                    p.display_name || p.user_id.slice(0, 8)
+                  )}
                   {p.status === "pending" && (
                     <span className="text-muted-foreground ml-1 text-sm">(pending)</span>
                   )}
@@ -325,7 +462,7 @@ export function GameSession({
                 </span>
                 {p.status === "approved" && (
                   <>
-                    {/* Host controls: edit official amounts and handle approval of requests */}
+                    {/* Host controls: always editable, even when session is closed */}
                     {isHost && (
                       <div className="flex flex-col gap-1">
                         <div className="flex flex-wrap items-center gap-2">
@@ -366,17 +503,16 @@ export function GameSession({
                             }}
                           />
                         </div>
-                        {(p.requested_cash_in !== p.cash_in ||
-                          p.requested_cash_out !== p.cash_out) && (
+                        {!isClosed && (p.requested_cash_in !== p.cash_in || p.requested_cash_out !== p.cash_out) && (
                           <div className="flex flex-col gap-1 text-xs text-muted-foreground">
                             {p.requested_cash_in !== p.cash_in && (
-                              <div className="flex items-center gap-2">
-                                <span>
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="flex-1">
                                   Requested in: {p.requested_cash_in} (current {p.cash_in})
                                 </span>
-                                <div className="flex gap-1">
+                                <div className="flex gap-1 shrink-0">
                                   <Button
-                                    size="xs"
+                                    size="sm"
                                     variant="outline"
                                     disabled={updating === p.user_id}
                                     onClick={() =>
@@ -390,7 +526,7 @@ export function GameSession({
                                     Approve
                                   </Button>
                                   <Button
-                                    size="xs"
+                                    size="sm"
                                     variant="ghost"
                                     disabled={updating === p.user_id}
                                     onClick={() =>
@@ -406,13 +542,13 @@ export function GameSession({
                               </div>
                             )}
                             {p.requested_cash_out !== p.cash_out && (
-                              <div className="flex items-center gap-2">
-                                <span>
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="flex-1">
                                   Requested out: {p.requested_cash_out} (current {p.cash_out})
                                 </span>
-                                <div className="flex gap-1">
+                                <div className="flex gap-1 shrink-0">
                                   <Button
-                                    size="xs"
+                                    size="sm"
                                     variant="outline"
                                     disabled={updating === p.user_id}
                                     onClick={() =>
@@ -426,7 +562,7 @@ export function GameSession({
                                     Approve
                                   </Button>
                                   <Button
-                                    size="xs"
+                                    size="sm"
                                     variant="ghost"
                                     disabled={updating === p.user_id}
                                     onClick={() =>
@@ -446,8 +582,8 @@ export function GameSession({
                       </div>
                     )}
 
-                    {/* Self (non-host) controls: request cash in/out values */}
-                    {!isHost && p.user_id === currentUserId && (
+                    {/* Non-host self: editable inputs when open, read-only when closed */}
+                    {!isHost && p.user_id === currentUserId && !isClosed && (
                       <div className="flex flex-col gap-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <Input
@@ -459,20 +595,13 @@ export function GameSession({
                               const v = parseFloat(e.target.value) || 0
                               setPlayers((prev) =>
                                 prev.map((x) =>
-                                  x.user_id === p.user_id
-                                    ? { ...x, requested_cash_in: v }
-                                    : x
+                                  x.user_id === p.user_id ? { ...x, requested_cash_in: v } : x
                                 )
                               )
                             }}
                             onBlur={(e) => {
                               const v = parseFloat(e.target.value) || 0
-                              updateRequestedCash(
-                                game.id,
-                                p.user_id,
-                                v,
-                                p.requested_cash_out
-                              )
+                              updateRequestedCash(game.id, p.user_id, v, p.requested_cash_out)
                             }}
                           />
                           <Input
@@ -484,33 +613,32 @@ export function GameSession({
                               const v = parseFloat(e.target.value) || 0
                               setPlayers((prev) =>
                                 prev.map((x) =>
-                                  x.user_id === p.user_id
-                                    ? { ...x, requested_cash_out: v }
-                                    : x
+                                  x.user_id === p.user_id ? { ...x, requested_cash_out: v } : x
                                 )
                               )
                             }}
                             onBlur={(e) => {
                               const v = parseFloat(e.target.value) || 0
-                              updateRequestedCash(
-                                game.id,
-                                p.user_id,
-                                p.requested_cash_in,
-                                v
-                              )
+                              updateRequestedCash(game.id, p.user_id, p.requested_cash_in, v)
                             }}
                           />
                         </div>
                         <span className="text-xs text-muted-foreground">
                           Current approved: In {p.cash_in} / Out {p.cash_out}
-                          {(p.requested_cash_in !== p.cash_in ||
-                            p.requested_cash_out !== p.cash_out) &&
+                          {(p.requested_cash_in !== p.cash_in || p.requested_cash_out !== p.cash_out) &&
                             " — awaiting host approval"}
                         </span>
                       </div>
                     )}
 
-                    {/* Other players (view only) */}
+                    {/* Non-host self: read-only when closed */}
+                    {!isHost && p.user_id === currentUserId && isClosed && (
+                      <span className="text-muted-foreground text-sm">
+                        In: {p.cash_in} / Out: {p.cash_out}
+                      </span>
+                    )}
+
+                    {/* Other players: always read-only */}
                     {!isHost && p.user_id !== currentUserId && (
                       <span className="text-muted-foreground text-sm">
                         In: {p.cash_in} / Out: {p.cash_out}
@@ -518,7 +646,7 @@ export function GameSession({
                     )}
                   </>
                 )}
-                {p.status === "pending" && !isHost && p.user_id === currentUserId && (
+                {p.status === "pending" && !isHost && p.user_id === currentUserId && !isClosed && (
                   <div className="flex flex-col gap-1">
                     <div className="flex flex-wrap items-center gap-2">
                       <Input
@@ -530,19 +658,14 @@ export function GameSession({
                           const v = parseFloat(e.target.value) || 0
                           setPlayers((prev) =>
                             prev.map((x) =>
-                              x.user_id === p.user_id
-                                ? { ...x, requested_cash_in: v }
-                                : x
+                              x.user_id === p.user_id ? { ...x, requested_cash_in: v } : x
                             )
                           )
                         }}
                         onBlur={(e) => {
                           const v = parseFloat(e.target.value) || 0
-                          updateRequestedCash(
-                            game.id,
-                            p.user_id,
-                            v,
-                            p.requested_cash_out
+                          updateRequestedAmounts(game.id, v, p.requested_cash_out).catch(() =>
+                            toast.error("Failed to save")
                           )
                         }}
                       />
@@ -555,19 +678,14 @@ export function GameSession({
                           const v = parseFloat(e.target.value) || 0
                           setPlayers((prev) =>
                             prev.map((x) =>
-                              x.user_id === p.user_id
-                                ? { ...x, requested_cash_out: v }
-                                : x
+                              x.user_id === p.user_id ? { ...x, requested_cash_out: v } : x
                             )
                           )
                         }}
                         onBlur={(e) => {
                           const v = parseFloat(e.target.value) || 0
-                          updateRequestedCash(
-                            game.id,
-                            p.user_id,
-                            p.requested_cash_in,
-                            v
+                          updateRequestedAmounts(game.id, p.requested_cash_in, v).catch(() =>
+                            toast.error("Failed to save")
                           )
                         }}
                       />
@@ -576,6 +694,56 @@ export function GameSession({
                       Waiting for host to approve your join request and amounts.
                     </span>
                   </div>
+                )}
+                {/* Denied self: offer to request rejoin */}
+                {!isHost && p.user_id === currentUserId && p.status === "denied" && (
+                  <div className="flex flex-col gap-1">
+                    <span className="text-xs text-red-400">
+                      You were removed from this table.
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={updating === p.user_id}
+                      onClick={async () => {
+                        setUpdating(p.user_id)
+                        try {
+                          await requestRejoin(game.id)
+                          // Optimistically flip to pending in local state
+                          setPlayers((prev) =>
+                            prev.map((x) =>
+                              x.user_id === p.user_id ? { ...x, status: "pending" } : x
+                            )
+                          )
+                          toast.success("Rejoin request sent — waiting for host approval")
+                        } catch {
+                          toast.error("Failed to send rejoin request")
+                        } finally {
+                          setUpdating(null)
+                        }
+                      }}
+                    >
+                      {updating === p.user_id
+                        ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        : null}
+                      Request to Rejoin
+                    </Button>
+                  </div>
+                )}
+
+                {/* Kick button — host only, not on self */}
+                {isHost && p.user_id !== currentUserId && (
+                  <button
+                    className="ml-auto flex h-6 w-6 items-center justify-center rounded-full text-zinc-500 hover:bg-red-500/10 hover:text-red-500 transition-colors disabled:opacity-40"
+                    title="Remove player"
+                    disabled={kicking === p.user_id}
+                    onClick={() => handleKick(p.user_id)}
+                  >
+                    {kicking === p.user_id
+                      ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      : <X className="h-3.5 w-3.5" />
+                    }
+                  </button>
                 )}
               </div>
             ))}
@@ -590,12 +758,108 @@ export function GameSession({
         </>
       )}
 
-      {isHost && approved.length >= 2 && (
-        <div className="flex justify-end">
-          <Button onClick={handleEndGame} disabled={ending}>
-            {ending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            End game
-          </Button>
+      {isHost && (
+        <div className="flex justify-end gap-2">
+          {approved.length >= 2 && (
+            <Button
+              onClick={handleEndGame}
+              disabled={ending}
+              variant="destructive"
+            >
+              {ending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              End Game
+            </Button>
+          )}
+        </div>
+      )}
+
+      {/* Transfer Host Modal */}
+      {selectedPlayer && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setSelectedPlayer(null)
+              setTransferConfirm(false)
+            }
+          }}
+        >
+          {/* Backdrop */}
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+
+          {/* Modal */}
+          <div className="relative z-10 w-full max-w-sm mx-4 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl p-6 space-y-5">
+            {/* Header */}
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-lg font-semibold">
+                <Crown className="h-5 w-5 text-yellow-500" />
+                Player Actions
+              </div>
+              <p className="text-zinc-400 text-sm">
+                {selectedPlayer.display_name || selectedPlayer.venmo_handle || selectedPlayer.user_id.slice(0, 8)}
+              </p>
+            </div>
+
+            {/* Transfer Host section */}
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 space-y-3">
+              <div className="flex items-center gap-2 font-medium text-sm">
+                <ArrowRightLeft className="h-4 w-4 text-zinc-400" />
+                Transfer Host
+              </div>
+              <p className="text-xs text-zinc-500">
+                This player will become the new host and gain full control of the game.
+                You will become a regular player.
+              </p>
+              {!transferConfirm ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
+                  onClick={() => setTransferConfirm(true)}
+                >
+                  Make Host
+                </Button>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-xs text-yellow-400 font-medium">
+                    Are you sure? This cannot be undone without the new host&apos;s consent.
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      className="flex-1"
+                      disabled={transferring}
+                      onClick={() => handleTransferHost(selectedPlayer.user_id)}
+                    >
+                      {transferring ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                      Confirm Transfer
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setTransferConfirm(false)}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Close */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="w-full text-zinc-500"
+              onClick={() => {
+                setSelectedPlayer(null)
+                setTransferConfirm(false)
+              }}
+            >
+              Close
+            </Button>
+          </div>
         </div>
       )}
     </div>
